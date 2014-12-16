@@ -1,5 +1,39 @@
 -*- coding: utf-8 -*-
 
+Version 3.17.5
+2014-Dec-15
+
+	* Bugifx generated NIF code for with the -strbin option: the
+	utf8_to_uint32 function was unused, as was (mostly) the
+	utf8_count_codepoints. Thanks to Louis-Philippe Gauthier for
+	reporting.
+
+Version 3.17.4
+2014-Dec-12
+
+	* Bugfix generated NIF code for enums defined within
+	messages. Thanks to Louis-Philippe Gauthier for reporting and
+	providing an initial solution.
+	* Bugfix generated NIF code for strings with the -strbin (or
+	strings_as_binaries) option. Thanks to Louis-Philippe Gauthier for
+	reporting and providing a solution.
+
+
+Version 3.17.3
+2014-Dec-02
+
+	* Bugfix parsing of files that specify a package, and import other
+	files that also specify a(nother) package. Thanks to Wang Chao for
+	asking the question prompting me to fix this.
+	* Add a -pkgs command line option, for use_packages.
+
+Version 3.17.2
+2014-Nov-13
+
+	* Rework the option parsing. No functional changes.
+	* in helpers/git-hooks/pre-push, allow push of non-tagged
+	non-master branches to github.
+
 Version 3.17.1
 2014-Oct-29
 

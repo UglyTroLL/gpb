@@ -1064,7 +1064,9 @@ nif_code_test_() ->
             {_,_,false} -> {"No C++ compiler found, not trying to compile", []};
             {_,_,_}     -> {"nif tests",
                             [{"Nif compiles", fun nif_compiles/0},
-                             {"Nif encode decode", fun nif_encode_decode/0}]}
+                             {"Nif encode decode", fun nif_encode_decode/0},
+                             {"Nif enums in msgs", fun nif_enum_in_msg/0},
+                             {"Nif with strbin", fun nif_with_strbin/0}]}
         end,
     %% Without increased timeout, this test frequently times
     %% out on my slow laptop (1.6 GHz Atom N270)
@@ -1169,7 +1171,71 @@ nif_encode_decode_oneof(NEDM, Defs) ->
                   Alts).
 
 
-compile_msg_defs(M, MsgDefs, TmpDir) ->
+nif_enum_in_msg() ->
+    with_tmpdir(
+      fun(TmpDir) ->
+              M = gpb_nif_test_enum_in_msgs,
+              DefsTxt = lf_lines(["message ntest1 {",
+                                  "    enum bo {",
+                                  "        x = 1;",
+                                  "        y = 2;",
+                                  "    };",
+                                  "    optional bo f1 = 1;",
+                                  "    repeated bo f2 = 2;",
+                                  "}"]),
+              Defs = parse_to_proto_defs(DefsTxt),
+              {ok, Code} = compile_msg_defs(M, DefsTxt, TmpDir),
+              with_tmpcode(
+                M, Code,
+                fun() ->
+                        OrigMsg = {ntest1,x,[x,y]},
+                        MEncoded  = M:encode_msg(OrigMsg),
+                        GEncoded  = gpb:encode_msg(OrigMsg, Defs),
+                        MMDecoded = M:decode_msg(MEncoded, ntest1),
+                        GMDecoded = gpb:decode_msg(MEncoded, ntest1, Defs),
+                        MGDecoded = M:decode_msg(GEncoded, ntest1),
+                        ?assertEqual(OrigMsg, MMDecoded),
+                        ?assertEqual(OrigMsg, GMDecoded),
+                        ?assertEqual(OrigMsg, MGDecoded)
+                end)
+      end).
+
+nif_with_strbin() ->
+    with_tmpdir(
+      fun(TmpDir) ->
+              M = gpb_nif_with_strbin,
+              DefsTxt = lf_lines(["message ntest2 {",
+                                  "    required string s = 1;",
+                                  "}"]),
+              Defs = parse_to_proto_defs(DefsTxt),
+              {ok, Code} = compile_msg_defs(M, DefsTxt, TmpDir,
+                                            [strings_as_binaries]),
+              with_tmpcode(
+                M, Code,
+                fun() ->
+                        OrigMsgB = {ntest2,<<"abc">>},
+                        OrigMsgS = {ntest2,"abc"}, %% gpb doesn't can't strbin
+                        MEncoded  = M:encode_msg(OrigMsgB),
+                        GEncoded  = gpb:encode_msg(OrigMsgB, Defs),
+                        MMDecoded = M:decode_msg(MEncoded, ntest2),
+                        GMDecoded = gpb:decode_msg(MEncoded, ntest2, Defs),
+                        MGDecoded = M:decode_msg(GEncoded, ntest2),
+                        ?assertEqual(OrigMsgB, MMDecoded),
+                        ?assertEqual(OrigMsgS, GMDecoded),
+                        ?assertEqual(OrigMsgB, MGDecoded)
+                end)
+      end).
+
+
+compile_msg_defs(M, MsgDefsOrIoList, TmpDir) ->
+    compile_msg_defs(M, MsgDefsOrIoList, TmpDir, []).
+
+compile_msg_defs(M, MsgDefsOrIoList, TmpDir, Opts) ->
+    {MsgDefs, ProtoTxt} =
+        case is_iolist(MsgDefsOrIoList) of
+            true -> {parse_to_proto_defs(MsgDefsOrIoList,Opts), MsgDefsOrIoList};
+            false -> {MsgDefsOrIoList, msg_defs_to_proto(MsgDefsOrIoList)}
+        end,
     [NifCcPath, PbCcPath, NifOPath, PbOPath, NifSoPath, ProtoPath] = Files  =
         [filename:join(TmpDir, lists:concat([M, Ext]))
          || Ext <- [".nif.cc", ".pb.cc", ".nif.o", ".pb.o", ".nif.so",
@@ -1177,11 +1243,10 @@ compile_msg_defs(M, MsgDefs, TmpDir) ->
     LoadNif = f("load_nif() -> erlang:load_nif(\"~s\", {{loadinfo}}).\n",
                 [filename:join(TmpDir, lists:concat([M,".nif"]))]),
     LoadNifOpt = {load_nif, LoadNif},
-    Opts = [binary, nif, LoadNifOpt],
-    {ok, M, Codes} = gpb_compile:proto_defs(M, MsgDefs, Opts),
+    Opts2 = [binary, nif, LoadNifOpt] ++ Opts,
+    {ok, M, Codes} = gpb_compile:proto_defs(M, MsgDefs, Opts2),
     Code = proplists:get_value(erl, Codes),
     NifTxt = proplists:get_value(nif, Codes),
-    ProtoTxt = msg_defs_to_proto(MsgDefs),
     %%
     ok = file:write_file(NifCcPath, NifTxt),
     ok = file:write_file(ProtoPath, ProtoTxt),
@@ -1217,6 +1282,26 @@ compile_msg_defs(M, MsgDefs, TmpDir) ->
                          ++ CompilePb ++ "\n"
                          ++ CompileSo]),
     {ok, Code}.
+
+lf_lines(Lines) ->
+    [[L,"\n"] || L <- Lines].
+
+is_iolist(X) ->
+    try iolist_to_binary(X), true
+    catch error:badarg -> false
+    end.
+
+parse_to_proto_defs(Iolist) ->
+    parse_to_proto_defs(Iolist, []).
+
+parse_to_proto_defs(Iolist, Opts) ->
+    B = iolist_to_binary(Iolist),
+    {ok, ProtoDefs} = gpb_compile:file(
+                        "X.proto",
+                        [mk_fileop_opt([{read_file, fun(_) -> {ok, B} end}]),
+                         {i,"."},
+                         to_proto_defs, report_warnings] ++ Opts),
+    ProtoDefs.
 
 %% Option to run with `save' for debugging nifs
 with_tmpdir(Fun) ->
@@ -1521,69 +1606,91 @@ mk_float(_, _) -> 1.0.
 
 %% --- command line options tests -----------------
 
+cmdline_parses_include_opt_test() ->
+    {ok, {[{i,"inc"}], []}} = gpb_compile:parse_opts_and_args(["-Iinc"]),
+    {ok, {[{i,"inc"}], []}} = gpb_compile:parse_opts_and_args(["-I","inc"]),
+    {error, _} = gpb_compile:parse_opts_and_args(["-I"]).
+
+cmdline_parses_noarg_opt_test() ->
+    {ok, {[defs_as_proplists], []}} =
+         gpb_compile:parse_opts_and_args(["-pldefs"]).
+
+cmdline_parses_string_opt_test() ->
+    {ok, {[{o_erl, "src"}], []}} =
+        gpb_compile:parse_opts_and_args(["-o-erl", "src"]),
+    {error, _} = gpb_compile:parse_opts_and_args(["-o-erl"]).
+
+cmdline_parses_alternatives_opt_test() ->
+    {ok, {[{copy_bytes, true}], []}} =
+        gpb_compile:parse_opts_and_args(["-c", "true"]),
+    {ok, {[{copy_bytes, 1.25}], []}} =
+        gpb_compile:parse_opts_and_args(["-c", "1.25"]).
+
+cmdline_parses_files_test() ->
+    {ok, {[], []}} = gpb_compile:parse_opts_and_args([]),
+    {ok, {[], ["f.proto"]}} = gpb_compile:parse_opts_and_args(["f.proto"]).
+
+cmdline_parses_also_non_proto_extensions_test() ->
+    {ok, {[type_specs, {copy_bytes,auto}], ["a.x", "y.proto"]}} =
+        gpb_compile:parse_opts_and_args(["-type", "-c", "auto",
+                                         "a.x", "y.proto"]).
+
 opt_test() ->
-
-    [{"I",string_maybe_appended,i, _}] = gpb_compile:find_opt_spec("Iinclude1"),
-    [{"I",string_maybe_appended,i, _}] = gpb_compile:find_opt_spec("I"),
-    [{"o-erl",string,o_erl, _}] = gpb_compile:find_opt_spec("o-erl"),
-    [{"o", string, o, _}] = gpb_compile:find_opt_spec("o"),
-    [{"o-hrl", string, o_hrl, _}] = gpb_compile:find_opt_spec("o-hrl"),
-
-    [{i,"include1"},
-     {i,"include2"},
-     {o,"out-dir"},
-     {o_erl,"o-erl-dir"},
-     {o_hrl,"o-hrl-dir"},
-     nif,
-     {load_nif, "load-nif"},
-     {verify,optionally},
-     {verify,always},
-     {verify,never},
-     {copy_bytes,true},
-     {copy_bytes,false},
-     {copy_bytes,auto},
-     {copy_bytes,42},
-     strings_as_binaries,defs_as_proplists,
-     {msg_name_prefix,"_msg_suffix"},
-     {module_name_prefix,"_mod_prefix"},
-     {msg_name_suffix,"_msg_suffix"},
-     {module_name_suffix,"_mod_suffix"},
-     include_as_lib,type_specs,
-     descriptor,
-     maps,help,help,version,version] = gpb_compile:parse_opts([
-            {list_to_atom("Iinclude1"), []},
-            {list_to_atom("I"), ["include2"]},
-            {o, ["out-dir"]},
-            {wrong_arg, ["wrong-arg-str"]},
-            {root, ["root-dir"]},
-            {list_to_atom("o-erl"), ["o-erl-dir"]},
-            {list_to_atom("o-hrl"), ["o-hrl-dir"]},
-            {list_to_atom("o-nic-cc"), ["o-nic-cc-dir"]},
-            {nif, []},
-            {load_nif, ["load-nif"]},
-            {v, ["optionally"]},
-            {v, ["always"]},
-            {v, ["never"]},
-            {c, ["true"]},
-            {c, ["false"]},
-            {c, ["auto"]},
-            {c, ["42"]},
-            {wrong_arg2, []},
-            {strbin, []},
-            {pldefs, []},
-            {msgprefix, ["_msg_suffix"]},
-            {modprefix, ["_mod_prefix"]},
-            {msgsuffix, ["_msg_suffix"]},
-            {modsuffix, ["_mod_suffix"]},
-            {il, []},
-            {type, []},
-            {descr, []},
-            {maps, []},
-            {h, []},
-            {list_to_atom("-help"), []},
-            {list_to_atom("V"), []},
-            {list_to_atom("-version"), []}
-        ], []).
+    {ok, {[{i, "include1"},
+           {i, "include2"},
+           {o, "out-dir"},
+           {o_erl, "o-erl-dir"},
+           {o_hrl, "o-hrl-dir"},
+           {o_nif_cc, "o-nif-cc-dir"},
+           nif,
+           {load_nif, "load-nif"},
+           {verify, optionally},
+           {verify, always},
+           {verify, never},
+           {copy_bytes, true},
+           {copy_bytes, false},
+           {copy_bytes, auto},
+           {copy_bytes, 42},
+           strings_as_binaries, defs_as_proplists,
+           use_packages,
+           {msg_name_prefix,    "msg_prefix_"},
+           {module_name_prefix, "mod_prefix_"},
+           {msg_name_suffix,    "_msg_suffix"},
+           {module_name_suffix, "_mod_suffix"},
+           include_as_lib, type_specs,
+           descriptor, maps,
+           help, help, version, version],
+          ["x.proto", "y.proto"]}} =
+        gpb_compile:parse_opts_and_args(
+          ["-Iinclude1",
+           "-I", "include2",
+           "-o", "out-dir",
+           "-o-erl", "o-erl-dir",
+           "-o-hrl", "o-hrl-dir",
+           "-o-nif-cc", "o-nif-cc-dir",
+           "-nif",
+           "-load_nif", "load-nif",
+           "-v", "optionally",
+           "-v", "always",
+           "-v", "never",
+           "-c", "true",
+           "-c", "false",
+           "-c", "auto",
+           "-c", "42",
+           "-strbin",
+           "-pldefs",
+           "-pkgs",
+           "-msgprefix", "msg_prefix_",
+           "-modprefix", "mod_prefix_",
+           "-msgsuffix", "_msg_suffix",
+           "-modsuffix", "_mod_suffix",
+           "-il",
+           "-type",
+           "-descr",
+           "-maps",
+           "-h", "--help",
+           "-V", "--version",
+           "x.proto", "y.proto"]).
 
 %% --- auxiliaries -----------------
 

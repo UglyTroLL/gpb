@@ -23,9 +23,10 @@
 -export([proto_defs/2, proto_defs/3]).
 -export([msg_defs/2, msg_defs/3]).
 -export([format_error/1, format_warning/1]).
--export([c/0, c/1]). % Command line interface, halts vm---don't use from shell!
--export([parse_opts/2, opt_specs/0, find_opt_spec/1, show_args/0,
-         show_version/0]).
+-export([c/0, c/1, c/2]). % Cmd line interface, halts vm---don't use from shell!
+-export([parse_opts_and_args/1]).
+-export([show_args/0]).
+-export([show_version/0]).
 -include_lib("kernel/include/file.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include("../include/gpb.hrl").
@@ -574,7 +575,9 @@ format_warning(X) ->
 %% With no proto file to compile, print a help message and exit.
 -spec c() -> no_return().
 c() ->
-    c([undefined]).
+    io:format("No proto files specified.~n"),
+    show_help(),
+    halt(0).
 
 %% @doc This function is intended as a command line interface for the compiler.
 %% Call it from the command line as follows:
@@ -620,6 +623,11 @@ c() ->
 %%   <dd>Specify that introspection functions shall return proplists
 %%       instead of `#field{}' records, to make the generated code
 %%       completely free of even compile-time dependencies to gpb.</dd>
+%%   <dt>`-pkgs'</dt>
+%%   <dd>Prepend the name of a package to every message it contains.
+%%       If no package is defined, nothing will be prepended.
+%%       Default is to not prepend package names for backwards
+%%       compatibility, but it is needed for some proto files.</dd>
 %%   <dt>`-msgprefix Prefix'</dt>
 %%   <dd>Prefix each message with `Prefix'. This can be useful to
 %%       when including different sub-projects that have colliding
@@ -660,65 +668,151 @@ c() ->
 -spec c([string() | atom()]) -> no_return().
 c([F | _]=Files) when is_atom(F); is_list(F) -> %% invoked with -s or -run
     erlang:system_flag(backtrace_depth, 32),
-    FileNames = [if File == undefined -> undefined;
-                    is_atom(File)     -> atom_to_list(File);
+    FileNames = [if is_atom(File)     -> atom_to_list(File);
                     is_list(File)     -> File
                  end
                  || File <- Files],
-    Args = init:get_arguments(),
+    InitArgs = init_args_to_argv(init:get_arguments()),
     PlainArgs = init:get_plain_arguments(),
-    Opts1 = parse_opts(Args, PlainArgs),
-    Opts2 = [report_warnings, report_errors] ++ Opts1,
-    Results = [case determine_cmdline_op(Opts2, FileName) of
-                   error  ->
-                       show_help(),
-                       halt(1);
-                   show_help  ->
-                       show_help(),
-                       halt(0);
-                   show_version  ->
-                       show_version(),
-                       halt(0);
-                   compile ->
-                       file(FileName, Opts2)
-               end
-               || FileName <- FileNames],
-    case lists:usort(Results) of
-        [ok]  -> halt(0);
-        _Errs -> halt(1)
-    end,
-    timer:sleep(infinity). %% give init:stop time to do its work
+    Argv = InitArgs ++ PlainArgs ++ FileNames,
+    case parse_opts_and_args(Argv) of
+        {ok, {Opts, Args}} ->
+            c(Opts, Args);
+        {error, Reason} ->
+            io:format("Error: ~s.~n", [Reason]),
+            show_args(),
+            halt(1)
+    end.
+
+init_args_to_argv(InitArgs) ->
+    lists:append([["-"++atom_to_list(OptName) | OptArgs]
+                  || {OptName, OptArgs} <- InitArgs,
+                     is_gpb_opt(OptName)]).
+
+%% Opts are expected to be on same format as accepted by file/2.
+%% pased by parse_opts_and_args/2.
+c(Opts, Args) ->
+    case determine_cmdline_op(Opts, Args) of
+        error  ->
+            show_help(),
+            halt(1);
+        show_help  ->
+            show_help(),
+            halt(0);
+        show_version  ->
+            show_version(),
+            halt(0);
+        compile ->
+            Opts2 = Opts ++ [report_warnings, report_errors],
+            Results = [file(FileName, Opts2) || FileName <- Args],
+            case lists:usort(Results) of
+                [ok]  -> halt(0);
+                _Errs -> halt(1)
+            end
+    end.
+
+parse_opts_and_args(Argv) ->
+    do_parse_argv(Argv, [], []).
+
+do_parse_argv(["-"++OptName=Opt | Rest], Opts, Files) ->
+    case find_opt_spec(OptName) of
+        {ok, OptSpec} ->
+            case parse_opt(OptName, OptSpec, Rest) of
+                {ok, {ParsedOpt, Rest2}} ->
+                    do_parse_argv(Rest2, [ParsedOpt | Opts], Files);
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        error ->
+            {error, "Unknown option " ++ Opt}
+    end;
+do_parse_argv([File | Rest], Opts, Files) ->
+    do_parse_argv(Rest, Opts, [File | Files]);
+do_parse_argv([], Opts, Files) ->
+    {ok, {lists:reverse(Opts), lists:reverse(Files)}}.
+
+is_gpb_opt(InitArgOptAtom) ->
+    find_opt_spec(atom_to_list(InitArgOptAtom)) /= error.
+
+find_opt_spec(OptName) ->
+    case [OptSpec || OptSpec <- opt_specs(), opt_matches(OptName, OptSpec)] of
+        [] ->
+            error;
+        [OptSpec] ->
+            {ok, OptSpec}
+    end.
+
+opt_matches(Opt, {OptName, 'string_maybe_appended()', _OptTag, _Descr}) ->
+    lists:prefix(OptName, Opt);
+opt_matches(Opt, {OptName, _Type, _OptTag, _Descr}) ->
+    Opt == OptName.
+
+parse_opt(Opt, {OptName, 'string_maybe_appended()', OptTag, _Descr}, Rest) ->
+    case {Opt, Rest} of
+        {OptName, [H | Rest2]} ->
+            {ok, {{OptTag, H}, Rest2}};
+        {OptName, []} ->
+            {error, "Missing argument for option -" ++ OptName};
+        _ ->
+            true = lists:prefix(OptName, Opt),
+            OptArg = string:substr(Opt, length(OptName)+1),
+            {ok, {{OptTag, OptArg}, Rest}}
+    end;
+parse_opt(OptName, {OptName, undefined, OptTag, _Descr}, Rest) ->
+    {ok, {OptTag, Rest}};
+parse_opt(OptName, {OptName, 'string()', OptTag, _Descr}, [OptArg | Rest]) ->
+    {ok, {{OptTag, OptArg}, Rest}};
+parse_opt(OptName, {OptName, Alternatives, OptTag, _Descr}, [OptArg | Rest]) ->
+    case parse_opt_alts(tuple_to_list(Alternatives), OptArg, OptTag) of
+        {ok, Opt} -> {ok, {Opt, Rest}};
+        error     -> {error, "Invalid argument for -" ++ OptName}
+    end;
+parse_opt(OptName, _OptSpec, []) ->
+    {error, "Missing argument for option -" ++ OptName}.
+
+parse_opt_alts(['number()' | Rest], OptArg, OptTag) ->
+    case string_to_number(OptArg) of
+        {ok, Value} -> {ok, {OptTag, Value}};
+        error       -> parse_opt_alts(Rest, OptArg, OptTag)
+    end;
+parse_opt_alts([Value | Rest], OptArg, OptTag) ->
+    case atom_to_list(Value) of
+        OptArg -> {ok, {OptTag, Value}};
+        _      -> parse_opt_alts(Rest, OptArg, OptTag)
+    end;
+parse_opt_alts([], _OptArg, _OptTag) ->
+    error.
 
 opt_specs() ->
     [
-     {"I", string_maybe_appended, i, "\n"
+     {"I", 'string_maybe_appended()', i, "\n"
       "       Specify include directory.\n"
       "       Option may be specified more than once to specify\n"
       "       several include directories.\n"},
-     {"o", string, o, "Dir\n"
+     {"o", 'string()', o, "Dir\n"
       "       Specify output directory for where to generate\n"
       "       the <ProtoFile>.erl and <ProtoFile>.hrl\n"},
-     {"o-erl", string, o_erl, "Dir\n"
+     {"o-erl", 'string()', o_erl, "Dir\n"
       "       Specify output directory for where to generate\n"
       "       the <ProtoFile>.erl.\n"
       "       The -o-erl Dir option overrides any -o Dir option, and\n"
       "       similarly for the other file-type specific output options.\n"},
-     {"o-hrl", string, o_hrl, "Dir\n"
+     {"o-hrl", 'string()', o_hrl, "Dir\n"
       "       Specify output directory for where to generate\n"
       "       the <ProtoFile>.hrl\n"},
-     {"o-nif-cc", string, o_nif_cc, "Dir\n"
+     {"o-nif-cc", 'string()', o_nif_cc, "Dir\n"
       "       Specify output directory for where to generate\n"
       "       the NIF C++ file, if the -nif option is specified\n"},
      {"nif", undefined, nif, "\n"
       "       Generate nifs for linking with the protobuf C(++) library.\n"},
-     {"load_nif", string, load_nif, "FunctionDefinition\n"
+     {"load_nif", 'string()', load_nif, "FunctionDefinition\n"
       "       Specify FunctionDefinition as the text that defines the\n"
       "       function load_nif/0.  This is called as the -on_load.\n"
       "       hook for loading the NIF.\n"},
      {"v", {optionally, always, never}, verify, " optionally | always | never\n"
       "       Specify how the generated encoder should\n"
       "       verify the message to be encoded.\n"},
-     {"c", {true, false, auto, integer, float}, copy_bytes,
+     {"c", {true, false, auto, 'number()'}, copy_bytes,
       " true | false | auto | number() \n"
       "       Specify how or when the generated decoder should\n"
       "       copy fields of type bytes.\n"},
@@ -729,13 +823,18 @@ opt_specs() ->
       "       Specify that introspection functions shall return proplists\n"
       "       instead of #field{} records, to make the generated code\n"
       "       completely free of even compile-time dependencies to gpb.\n"},
-     {"msgprefix", string, msg_name_prefix, "Prefix\n"
+     {"pkgs", undefined, use_packages, "\n"
+      "       Prepend the name of a package to every message it contains.\n"
+      "       If no package is defined, nothing will be prepended.\n"
+      "       Default is to not prepend package names for backwards\n"
+      "       compatibility, but it is needed for some proto files.\n"},
+     {"msgprefix", 'string()', msg_name_prefix, "Prefix\n"
       "       Prefix each message with Prefix.\n"},
-     {"modprefix", string, module_name_prefix, "Prefix\n"
+     {"modprefix", 'string()', module_name_prefix, "Prefix\n"
       "       Prefix the module name with Prefix.\n"},
-     {"msgsuffix", string, msg_name_suffix, "Suffix\n"
+     {"msgsuffix", 'string()', msg_name_suffix, "Suffix\n"
       "       Suffix each message with Suffix.\n"},
-     {"modsuffix", string, module_name_suffix, "Suffix\n"
+     {"modsuffix", 'string()', module_name_suffix, "Suffix\n"
       "       Suffix the module name with Suffix.\n"},
      {"il", undefined, include_as_lib, "\n"
       "       Generate code that includes gpb.hrl using -include_lib\n"
@@ -767,35 +866,13 @@ opt_specs() ->
       "       Show version\n"}
     ].
 
-find_opt_spec(Opt) ->
-    lists:filter(fun({OptDef, OptType, _, _}) ->
-                         %% the type of comparison depends on the opt spec type
-                         case OptType of
-                             %% if the opt arg may be appended to the option
-                             %% (ie. -Iinclude1)
-                             string_maybe_appended ->
-                                 case re:run(Opt, "^"++OptDef) of
-                                     {match, _} -> true;
-                                     nomatch -> false
-                                 end;
-                             %% for the other cases an exact match is required
-                             _ ->
-                                 Opt == OptDef
-                         end
-                 end, opt_specs()).
 
-determine_cmdline_op(Opts, FileName) ->
-    Help = lists:member(help, Opts) orelse
-        FileName == "-h" orelse
-        FileName == "--help",
-    Vsn = lists:member(version, Opts) orelse
-        FileName == "-V" orelse
-        FileName == "--version",
-    case {Help, Vsn} of
+determine_cmdline_op(Opts, FileNames) ->
+    case {lists:member(help, Opts), lists:member(version, Opts)} of
         {true, _} -> show_help;
         {_, true} -> show_version;
-        _         -> if FileName == undefined -> error;
-                        is_list(FileName)     -> compile
+        _         -> if FileNames == [] -> error;
+                        FileNames /= [] -> compile
                      end
     end.
 
@@ -809,7 +886,7 @@ show_help() ->
       [gpb:version_as_string(), ?MODULE, ?MODULE]),
     show_args().
 
-show_arg({OptDef, string_maybe_appended, _, OptDoc}) ->
+show_arg({OptDef, 'string_maybe_appended()', _, OptDoc}) ->
     io:format("   -~s   -~sOption ~s", [OptDef, OptDef, OptDoc]);
 show_arg({OptDef, _, _, OptDoc}) ->
     io:format("   -~s ~s", [OptDef, OptDoc]).
@@ -823,46 +900,6 @@ show_args() ->
 show_version() ->
     io:format("gpb version ~s~n", [gpb:version_as_string()]).
 
-parse_opts(Args, PlainArgs) ->
-    arg_zf(fun parse_opt/1, Args) ++ plain_arg_zf(fun parse_opt/1, PlainArgs).
-
-parse_opt({Opt, OptArg}) ->
-    parse_opt_spec(find_opt_spec(Opt), Opt, OptArg).
-
-parse_opt_spec([{OptDef, string_maybe_appended, OptErl, _}], Opt, OptArg) ->
-    %% now check what is the form, <Option> <OptArg> (ie. I include)
-    %% or <Option><OptArg> (ie. Iinclude)
-    case Opt == OptDef of
-        true ->
-            [OptArg2] = OptArg,
-            {true, {OptErl, OptArg2}};
-        false ->
-            %% if of the form <Option><OptArg> (ie. Iinclude), must subtract
-            %% OptDef from Opt to obtain OptArg
-            {true, {OptErl, Opt -- OptDef}}
-    end;
-%% opt spec undefined means that the option has no arg
-parse_opt_spec([{_, undefined, OptErl, _}], _, _) ->
-    {true, OptErl};
-%% opt spec with tuples as types means they are restricted to a set of
-%% possible values
-parse_opt_spec([{_, OptType, OptErl, _}], _, [OptArg]) when is_tuple(OptType) ->
-    case lists:member(list_to_atom(OptArg), tuple_to_list(OptType)) of
-        true -> {true, {OptErl, list_to_atom(OptArg)}};
-        %% opt arg does not belong in the tuple, however it could be a number
-        false ->
-            case string_to_number(OptArg) of
-                {ok, OptNum} -> {true, {OptErl, OptNum}};
-                error     -> false
-            end
-    end;
-%% standard opt spec with arg
-parse_opt_spec([{_, _, OptErl, _}], _, [OptArg]) ->
-    {true, {OptErl, OptArg}};
-%% not a valid option
-parse_opt_spec([], _, _) ->
-    false.
-
 string_to_number(S) ->
     try {ok, list_to_integer(S)}
     catch error:badarg ->
@@ -871,31 +908,10 @@ string_to_number(S) ->
             end
     end.
 
-arg_zf(ZFFun, Args) ->
-    lists:zf(ZFFun, [{atom_to_list(Opt), OptArgs} || {Opt, OptArgs} <- Args]).
-
-plain_arg_zf(ZFFun, PlainArgs) ->
-    lists:zf(ZFFun, plainargs_to_args(PlainArgs)).
-
-plainargs_to_args(["-"++Opt1, "-"++_=Opt2 | Rest]) ->
-    [{Opt1, []} | plainargs_to_args([Opt2 | Rest])];
-plainargs_to_args(["-"++Opt | OptArgsAndRest]) ->
-    {OptArgs, Rest} = plainoptargs_to_args(OptArgsAndRest, []),
-    [{Opt, OptArgs} | plainargs_to_args(Rest)];
-plainargs_to_args([]) ->
-    [].
-
-plainoptargs_to_args(["-"++_ | _]=Rest, Acc) ->
-    {lists:reverse(Acc), Rest};
-plainoptargs_to_args([OptArg | Rest], Acc) ->
-    plainoptargs_to_args(Rest, [OptArg | Acc]);
-plainoptargs_to_args([], Acc) ->
-    {lists:reverse(Acc), []}.
-
 parse_file(FName, Opts) ->
     case parse_file_and_imports(FName, Opts) of
         {ok, {Defs1, _AllImported}} ->
-            case gpb_parse:post_process(Defs1, Opts) of
+            case gpb_parse:post_process_all_files(Defs1, Opts) of
                 {ok, Defs2} ->
                     {ok, Defs2};
                 {error, Reasons} ->
@@ -915,7 +931,7 @@ parse_file_and_imports(FName, AlreadyImported, Opts) ->
             %% case we get an error we don't want to try to reprocess it later
             %% (in case it is multiply imported) and get the error again.
             AlreadyImported2 = [FName | AlreadyImported],
-            case scan_and_parse_string(binary_to_list(Contents), FName) of
+            case scan_and_parse_string(binary_to_list(Contents), FName, Opts) of
                 {ok, Defs} ->
                     Imports = gpb_parse:fetch_imports(Defs),
                     read_and_parse_imports(Imports,AlreadyImported2,Defs,Opts);
@@ -926,12 +942,17 @@ parse_file_and_imports(FName, AlreadyImported, Opts) ->
             {error, Reason}
     end.
 
-scan_and_parse_string(S, FName) ->
+scan_and_parse_string(S, FName, Opts) ->
     case gpb_scan:string(S) of
         {ok, Tokens, _} ->
             case gpb_parse:parse(Tokens++[{'$end', 999}]) of
-                {ok, Result} ->
-                    {ok, Result};
+                {ok, ParseTree} ->
+                    case gpb_parse:post_process_one_file(ParseTree, Opts) of
+                        {ok, Result} ->
+                            {ok, Result};
+                        {error, Reason} ->
+                            {error, {parse_error, FName, Reason}}
+                    end;
                 {error, {_Line, _Module, _ErrInfo}=Reason} ->
                     {error, {parse_error, FName, Reason}}
             end;
@@ -3664,6 +3685,9 @@ d_r("."++Rest, New) -> New ++ d_r(Rest, New);
 d_r([C|Rest], New)  -> [C | d_r(Rest, New)];
 d_r("", _New)       -> "".
 
+is_dotted(S) when is_list(S) -> string:str(S, ".") > 0;
+is_dotted(S) when is_atom(S) -> is_dotted(atom_to_list(S)).
+
 %% -- nif c++ code -----------------------------------------------------
 
 possibly_format_nif_cc(Mod, Defs, AnRes, Opts) ->
@@ -3788,113 +3812,118 @@ is_any_field_of_type_bool(#anres{used_types=UsedTypes}) ->
     sets:is_element(bool, UsedTypes).
 
 format_nif_cc_utf8_conversion_code(Opts) ->
-    ["/* Source for info is https://www.ietf.org/rfc/rfc2279.txt */\n",
-     "\n",
-     "static int\n",
-     "utf8_count_codepoints(const char *sinit, int len)\n",
-     "{\n",
-     "    int n = 0;\n",
-     "    const unsigned char *s0 = (unsigned char *)sinit;\n",
-     "    const unsigned char *s  = s0;\n",
-     "\n",
-     "    while ((s - s0) < len)\n",
-     "    {\n",
-     "        if (*s <= 0x7f) { n++; s++; } /* code point fits 1 octet */\n",
-     "        else if (*s <= 0xdf) { n++; s += 2; } /* 2 octets */\n",
-     "        else if (*s <= 0xef) { n++; s += 3; } /* 3 octets */\n",
-     "        else if (*s <= 0xf7) { n++; s += 4; }\n",
-     "        else if (*s <= 0xfb) { n++; s += 5; }\n",
-     "        else if (*s <= 0xfd) { n++; s += 6; }\n",
-     "        else return -1;\n",
-     "\n",
-     "        if ((s - s0) > len)\n",
-     "            return -1;\n",
-     "    }\n",
-     "    return n;\n",
-     "}\n",
-     "\n",
-     "static int\n",
-     "utf8_to_uint32(unsigned int *dest, const char *src, int numCodePoints)\n",
-     "{\n",
-     "    int i;\n",
-     "    const unsigned char *s = (unsigned char *)src;\n",
-     "\n",
-     "\n",
-     "    /* Should perhaps check for illegal chars in d800-dfff and\n",
-     "     * a other illegal chars\n",
-     "     */\n",
-     "\n",
-     "    for (i = 0; i < numCodePoints; i++)\n",
-     "    {\n",
-     "        if (*s <= 0x7f)\n",
-     "            *dest++ = *s++;\n",
-     "        else if (*s <= 0xdf) /* code point is 2 octets long */\n",
-     "        {\n",
-     "            *dest   =  *s++ & 0x1f; *dest <<= 6;\n",
-     "            *dest++ |= *s++ & 0x3f;\n",
-     "        }\n",
-     "        else if (*s <= 0xef) /* code point is 3 octets long */\n",
-     "        {\n",
-     "            *dest   =  *s++ & 0x0f; *dest <<= 6;\n",
-     "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
-     "            *dest++ |= *s++ & 0x3f;\n",
-     "        }\n",
-     "        else if (*s <= 0xf7) /* code point is 4 octets long */\n",
-     "        {\n",
-     "            *dest   =  *s++ & 0x07; *dest <<= 6;\n",
-     "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
-     "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
-     "            *dest++ |= *s++ & 0x3f;\n",
-     "        }\n",
-     "        else if (*s <= 0xfb) /* code point is 5 octets long */\n",
-     "        {\n",
-     "            *dest   =  *s++ & 0x03; *dest <<= 6;\n",
-     "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
-     "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
-     "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
-     "            *dest++ |= *s++ & 0x3f;\n",
-     "        }\n",
-     "        else if (*s <= 0xfd) /* code point is 6 octets long */\n",
-     "        {\n",
-     "            *dest   =  *s++ & 0x01; *dest <<= 6;\n",
-     "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
-     "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
-     "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
-     "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
-     "            *dest++ |= *s++ & 0x3f;\n",
-     "        }\n",
-     "        else\n",
-     "            return 0;\n",
-     "    }\n",
-     "    return 1;\n",
-     "}\n",
-     "\n"
-     "static ERL_NIF_TERM\n",
-     "utf8_to_erl_string(ErlNifEnv *env,\n",
-     "                   const char *utf8data,\n",
-     "                   unsigned int numOctets)\n",
-     "{\n",
-     "    int numcp = utf8_count_codepoints(utf8data, numOctets);\n",
-     "\n",
-     "    if (numcp < 0)\n",
-     "    {\n",
-     "        return enif_make_string(env,\n",
-     "                                \"<invalid UTF-8>\",\n",
-     "                                ERL_NIF_LATIN1);\n",
-     "    }\n",
-     "    else\n",
-     case get_strings_as_binaries_by_opts(Opts) of
+    [case get_strings_as_binaries_by_opts(Opts) of
          true ->
-             ["    {\n",
-              "        ERL_NIF_TERM   b;\n",
-              "        unsigned char *data;\n",
+             ["static ERL_NIF_TERM\n",
+              "utf8_to_erl_string(ErlNifEnv *env,\n",
+              "                   const char *utf8data,\n",
+              "                   unsigned int numOctets)\n"
+              "{\n",
+              "    ERL_NIF_TERM   b;\n",
+              "    unsigned char *data;\n",
               "\n",
-              "        data = enif_make_new_binary(env, numOctets, &b);\n",
-              "        memmove(data, utf8data, numOctets);\n",
-              "        return b;\n",
-              "    }\n"];
+              "    data = enif_make_new_binary(env, numOctets, &b);\n",
+              "    memmove(data, utf8data, numOctets);\n",
+              "    return b;\n",
+              "}\n"];
          false ->
-             ["    {\n",
+             ["/* Source for info is https://www.ietf.org/rfc/rfc2279.txt */\n",
+              "\n",
+              "static int\n",
+              "utf8_count_codepoints(const char *sinit, int len)\n",
+              "{\n",
+              "    int n = 0;\n",
+              "    const unsigned char *s0 = (unsigned char *)sinit;\n",
+              "    const unsigned char *s  = s0;\n",
+              "\n",
+              "    while ((s - s0) < len)\n",
+              "    {\n",
+              "        if (*s <= 0x7f) { n++; s++; } /* code point fits 1 octet */\n",
+              "        else if (*s <= 0xdf) { n++; s += 2; } /* 2 octets */\n",
+              "        else if (*s <= 0xef) { n++; s += 3; } /* 3 octets */\n",
+              "        else if (*s <= 0xf7) { n++; s += 4; }\n",
+              "        else if (*s <= 0xfb) { n++; s += 5; }\n",
+              "        else if (*s <= 0xfd) { n++; s += 6; }\n",
+              "        else return -1;\n",
+              "\n",
+              "        if ((s - s0) > len)\n",
+              "            return -1;\n",
+              "    }\n",
+              "    return n;\n",
+              "}\n",
+              "\n",
+              "static int\n",
+              "utf8_to_uint32(unsigned int *dest, const char *src,\n",
+              "               int numCodePoints)\n",
+              "{\n",
+              "    int i;\n",
+              "    const unsigned char *s = (unsigned char *)src;\n",
+              "\n",
+              "\n",
+              "    /* Should perhaps check for illegal chars in d800-dfff and\n",
+              "     * a other illegal chars\n",
+              "     */\n",
+              "\n",
+              "    for (i = 0; i < numCodePoints; i++)\n",
+              "    {\n",
+              "        if (*s <= 0x7f)\n",
+              "            *dest++ = *s++;\n",
+              "        else if (*s <= 0xdf) /* code point is 2 octets long */\n",
+              "        {\n",
+              "            *dest   =  *s++ & 0x1f; *dest <<= 6;\n",
+              "            *dest++ |= *s++ & 0x3f;\n",
+              "        }\n",
+              "        else if (*s <= 0xef) /* code point is 3 octets long */\n",
+              "        {\n",
+              "            *dest   =  *s++ & 0x0f; *dest <<= 6;\n",
+              "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
+              "            *dest++ |= *s++ & 0x3f;\n",
+              "        }\n",
+              "        else if (*s <= 0xf7) /* code point is 4 octets long */\n",
+              "        {\n",
+              "            *dest   =  *s++ & 0x07; *dest <<= 6;\n",
+              "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
+              "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
+              "            *dest++ |= *s++ & 0x3f;\n",
+              "        }\n",
+              "        else if (*s <= 0xfb) /* code point is 5 octets long */\n",
+              "        {\n",
+              "            *dest   =  *s++ & 0x03; *dest <<= 6;\n",
+              "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
+              "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
+              "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
+              "            *dest++ |= *s++ & 0x3f;\n",
+              "        }\n",
+              "        else if (*s <= 0xfd) /* code point is 6 octets long */\n",
+              "        {\n",
+              "            *dest   =  *s++ & 0x01; *dest <<= 6;\n",
+              "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
+              "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
+              "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
+              "            *dest   |= *s++ & 0x3f; *dest <<= 6;\n",
+              "            *dest++ |= *s++ & 0x3f;\n",
+              "        }\n",
+              "        else\n",
+              "            return 0;\n",
+              "    }\n",
+              "    return 1;\n",
+              "}\n",
+              "\n",
+              "static ERL_NIF_TERM\n",
+              "utf8_to_erl_string(ErlNifEnv *env,\n",
+              "                   const char *utf8data,\n",
+              "                   unsigned int numOctets)\n",
+              "{\n",
+              "    int numcp = utf8_count_codepoints(utf8data, numOctets);\n",
+              "\n",
+              "    if (numcp < 0)\n",
+              "    {\n",
+              "        return enif_make_string(env,\n",
+              "                                \"<invalid UTF-8>\",\n",
+              "                                ERL_NIF_LATIN1);\n",
+              "    }\n",
+              "    else\n",
+              "    {\n",
               "        unsigned int  cp[numcp];\n",
               "        ERL_NIF_TERM  es[numcp];\n",
               "        int i;\n",
@@ -3903,101 +3932,101 @@ format_nif_cc_utf8_conversion_code(Opts) ->
               "        for (i = 0; i < numcp; i++)\n",
               "            es[i] = enif_make_uint(env, cp[i]);\n",
               "        return enif_make_list_from_array(env, es, numcp);\n"
-              "    }\n"]
+              "    }\n",
+              "}\n"]
      end,
-     "}\n",
      "\n",
      case get_strings_as_binaries_by_opts(Opts) of
          true ->
              "";
          false ->
-              "static int\n"
-              "utf8_count_octets(ErlNifEnv *env, ERL_NIF_TERM str)\n"
-              "{\n"
-              "    int n = 0;\n"
-              "\n"
-              "    while (!enif_is_empty_list(env, str))\n"
-              "    {\n"
-              "        ERL_NIF_TERM head, tail;\n"
-              "        unsigned int c;\n"
-              "\n"
-              "        if (!enif_get_list_cell(env, str, &head, &tail))\n"
-              "            return -1;\n"
-              "        if (!enif_get_uint(env, head, &c))\n"
-              "            return -1;\n"
-              "\n"
-              "        if (c <= 0x7f) n += 1;\n"
-              "        else if (c <= 0x7ff) n += 2;\n"
-              "        else if (c <= 0xffff) n += 3;\n"
-              "        else if (c <= 0x1Fffff) n += 4;\n"
-              "        else if (c <= 0x3FFffff) n += 5;\n"
-              "        else if (c <= 0x7FFFffff) n += 6;\n"
-              "        else return -1;\n"
-              "\n"
-              "        str = tail;\n"
-              "    }\n"
-              "    return n;\n"
-              "}\n"
-              "\n"
-              "static int\n"
-              "utf8_to_octets(ErlNifEnv *env, ERL_NIF_TERM str, char *dest)\n"
-              "{\n"
-              "    unsigned char *s = (unsigned char *)dest;\n"
-              "\n"
-              "    while (!enif_is_empty_list(env, str))\n"
-              "    {\n"
-              "        ERL_NIF_TERM head, tail;\n"
-              "        unsigned int c;\n"
-              "\n"
-              "        if (!enif_get_list_cell(env, str, &head, &tail))\n"
-              "            return -1;\n"
-              "        if (!enif_get_uint(env, head, &c))\n"
-              "            return -1;\n"
-              "\n"
-              "        if (c <= 0x7f)\n"
-              "            *s++ = c;\n"
-              "        else if (c <= 0x7ff)\n"
-              "        {\n"
-              "            *s++ = 0xc0 | (c >> 6);\n"
-              "            *s++ = 0x80 | (c & 0x3f);\n"
-              "        }\n"
-              "        else if (c <= 0xffff)\n"
-              "        {\n"
-              "            *s++ = 0xe0 | (c >> 12);\n"
-              "            *s++ = 0x80 | ((c >> 6) & 0x3f);\n"
-              "            *s++ = 0x80 | (c        & 0x3f);\n"
-              "        }\n"
-              "        else if (c <= 0x1Fffff)\n"
-              "        {\n"
-              "            *s++ = 0xf0 | (c >> 18);\n"
-              "            *s++ = 0x80 | ((c >> 12) & 0x3f);\n"
-              "            *s++ = 0x80 | ((c >>  6) & 0x3f);\n"
-              "            *s++ = 0x80 | (c         & 0x3f);\n"
-              "        }\n"
-              "        else if (c <= 0x3FFffff)\n"
-              "        {\n"
-              "            *s++ = 0xf0 | (c >> 24);\n"
-              "            *s++ = 0x80 | ((c >> 18) & 0x3f);\n"
-              "            *s++ = 0x80 | ((c >> 12) & 0x3f);\n"
-              "            *s++ = 0x80 | ((c >>  6) & 0x3f);\n"
-              "            *s++ = 0x80 | (c         & 0x3f);\n"
-              "        }\n"
-              "        else if (c <= 0x7FFFffff)\n"
-              "        {\n"
-              "            *s++ = 0xf0 | (c >> 30);\n"
-              "            *s++ = 0x80 | ((c >> 24) & 0x3f);\n"
-              "            *s++ = 0x80 | ((c >> 18) & 0x3f);\n"
-              "            *s++ = 0x80 | ((c >> 12) & 0x3f);\n"
-              "            *s++ = 0x80 | ((c >>  6) & 0x3f);\n"
-              "            *s++ = 0x80 | (c         & 0x3f);\n"
-              "        }\n"
-              "        else\n"
-              "            return 0;\n"
-              "\n"
-              "        str = tail;\n"
-              "    }\n"
+             ["static int\n",
+              "utf8_count_octets(ErlNifEnv *env, ERL_NIF_TERM str)\n",
+              "{\n",
+              "    int n = 0;\n",
+              "\n",
+              "    while (!enif_is_empty_list(env, str))\n",
+              "    {\n",
+              "        ERL_NIF_TERM head, tail;\n",
+              "        unsigned int c;\n",
+              "\n",
+              "        if (!enif_get_list_cell(env, str, &head, &tail))\n",
+              "            return -1;\n",
+              "        if (!enif_get_uint(env, head, &c))\n",
+              "            return -1;\n",
+              "\n",
+              "        if (c <= 0x7f) n += 1;\n",
+              "        else if (c <= 0x7ff) n += 2;\n",
+              "        else if (c <= 0xffff) n += 3;\n",
+              "        else if (c <= 0x1Fffff) n += 4;\n",
+              "        else if (c <= 0x3FFffff) n += 5;\n",
+              "        else if (c <= 0x7FFFffff) n += 6;\n",
+              "        else return -1;\n",
+              "\n",
+              "        str = tail;\n",
+              "    }\n",
+              "    return n;\n",
+              "}\n",
+              "\n",
+              "static int\n",
+              "utf8_to_octets(ErlNifEnv *env, ERL_NIF_TERM str, char *dest)\n",
+              "{\n",
+              "    unsigned char *s = (unsigned char *)dest;\n",
+              "\n",
+              "    while (!enif_is_empty_list(env, str))\n",
+              "    {\n",
+              "        ERL_NIF_TERM head, tail;\n",
+              "        unsigned int c;\n",
+              "\n",
+              "        if (!enif_get_list_cell(env, str, &head, &tail))\n",
+              "            return -1;\n",
+              "        if (!enif_get_uint(env, head, &c))\n",
+              "            return -1;\n",
+              "\n",
+              "        if (c <= 0x7f)\n",
+              "            *s++ = c;\n",
+              "        else if (c <= 0x7ff)\n",
+              "        {\n",
+              "            *s++ = 0xc0 | (c >> 6);\n",
+              "            *s++ = 0x80 | (c & 0x3f);\n",
+              "        }\n",
+              "        else if (c <= 0xffff)\n",
+              "        {\n",
+              "            *s++ = 0xe0 | (c >> 12);\n",
+              "            *s++ = 0x80 | ((c >> 6) & 0x3f);\n",
+              "            *s++ = 0x80 | (c        & 0x3f);\n",
+              "        }\n",
+              "        else if (c <= 0x1Fffff)\n",
+              "        {\n",
+              "            *s++ = 0xf0 | (c >> 18);\n",
+              "            *s++ = 0x80 | ((c >> 12) & 0x3f);\n",
+              "            *s++ = 0x80 | ((c >>  6) & 0x3f);\n",
+              "            *s++ = 0x80 | (c         & 0x3f);\n",
+              "        }\n",
+              "        else if (c <= 0x3FFffff)\n",
+              "        {\n",
+              "            *s++ = 0xf0 | (c >> 24);\n",
+              "            *s++ = 0x80 | ((c >> 18) & 0x3f);\n",
+              "            *s++ = 0x80 | ((c >> 12) & 0x3f);\n",
+              "            *s++ = 0x80 | ((c >>  6) & 0x3f);\n",
+              "            *s++ = 0x80 | (c         & 0x3f);\n",
+              "        }\n",
+              "        else if (c <= 0x7FFFffff)\n",
+              "        {\n",
+              "            *s++ = 0xf0 | (c >> 30);\n",
+              "            *s++ = 0x80 | ((c >> 24) & 0x3f);\n",
+              "            *s++ = 0x80 | ((c >> 18) & 0x3f);\n",
+              "            *s++ = 0x80 | ((c >> 12) & 0x3f);\n",
+              "            *s++ = 0x80 | ((c >>  6) & 0x3f);\n",
+              "            *s++ = 0x80 | (c         & 0x3f);\n",
+              "        }\n",
+              "        else\n",
+              "            return 0;\n",
+              "\n",
+              "        str = tail;\n",
+              "    }\n",
               "    return 1;\n"
-              "}\n"
+              "}\n"]
      end,
      "\n"].
 
@@ -4279,16 +4308,20 @@ format_nif_cc_field_packer_single(SrcVar, MsgVar, Field, Defs, Opts, Setter) ->
                   "}\n",
                   [SrcVar, MsgVar, SetterFnName, MsgVar, SetterFnName]);
            {enum, EnumName} ->
+               EPrefix = case is_dotted(EnumName) of
+                             false -> "";
+                             true  -> dot_replace_s(EnumName, "_") ++ "_"
+                         end,
                {value, {{enum,EnumName}, Enumerations}} =
                    lists:keysearch({enum,EnumName}, 1, Defs),
                ["{\n",
                 [?f("    ~sif (enif_is_identical(~s, ~s))\n"
-                    "        ~s->~s(~s);\n",
+                    "        ~s->~s(~s~s);\n",
                     [if I == 1 -> "";
                         I >  1 -> "else "
                      end,
                      SrcVar, mk_c_var(gpb_aa_, Sym),
-                     MsgVar, SetterFnName, Sym])
+                     MsgVar, SetterFnName, EPrefix, Sym])
                  || {I, {Sym, _Val}} <- index_seq(Enumerations)],
                 "    else\n"
                 "        return 0;\n"
@@ -4300,7 +4333,8 @@ format_nif_cc_field_packer_single(SrcVar, MsgVar, Field, Defs, Opts, Setter) ->
                           "    ErlNifBinary b;\n"
                           "    if (!enif_inspect_binary(env, ~s, &b))\n"
                           "        return 0;\n"
-                          "    ~s->~s(b.data, b.size);\n"
+                          "    ~s->~s(reinterpret_cast<const char *>(b.data),\n"
+                          "           b.size);\n"
                           "}\n",
                           [SrcVar, MsgVar, SetterFnName]);
                    false ->
@@ -4529,12 +4563,16 @@ format_nif_cc_field_unpacker_by_type(DestVar, MsgVar, Field, Defs) ->
              ?f("else\n"),
              ?f("    ~s = gpb_aa_false;\n", [DestVar])];
         {enum, EnumName} ->
+            EPrefix = case is_dotted(EnumName) of
+                          false -> "";
+                          true  -> dot_replace_s(EnumName, "_") ++ "_"
+                      end,
             {value, {{enum,EnumName}, Enumerations}} =
                 lists:keysearch({enum,EnumName}, 1, Defs),
             [] ++
                 [?f("switch (~s->~s()) {\n", [MsgVar, LCFName])] ++
-                [?f("    case ~s: ~s = ~s; break;\n",
-                    [Sym, DestVar, mk_c_var(gpb_aa_, Sym)])
+                [?f("    case ~s~s: ~s = ~s; break;\n",
+                    [EPrefix, Sym, DestVar, mk_c_var(gpb_aa_, Sym)])
                  || {Sym, _Value} <- Enumerations] ++
                 [?f("    default: ~s = gpb_aa_undefined;\n", [DestVar])] ++
                 [?f("}\n")];
@@ -4565,7 +4603,6 @@ format_nif_cc_field_unpacker_by_type(DestVar, MsgVar, Field, Defs) ->
             [?f("~s = ~s(env, &~s->~s());\n",
                 [DestVar, UnpackFnName, MsgVar, LCFName])]
     end.
-
 
 format_nif_cc_field_unpacker_repeated(DestVar, MsgVar, Field, Defs) ->
     #?gpb_field{name=FName, type=FType} = Field,
@@ -4610,12 +4647,16 @@ format_nif_cc_field_unpacker_repeated(DestVar, MsgVar, Field, Defs) ->
                 ?f("else\n"),
                 ?f("    relem[i] = gpb_aa_false;\n")];
            {enum, EnumName} ->
+               EPrefix = case is_dotted(EnumName) of
+                             false -> "";
+                             true  -> dot_replace_s(EnumName, "_") ++ "_"
+                         end,
                {value, {{enum,EnumName}, Enumerations}} =
                    lists:keysearch({enum,EnumName}, 1, Defs),
                [] ++
                    [?f("switch (~s->~s(i)) {\n", [MsgVar, LCFName])] ++
-                   [?f("    case ~s: relem[i] = ~s; break;\n",
-                       [Sym, mk_c_var(gpb_aa_, Sym)])
+                   [?f("    case ~s~s: relem[i] = ~s; break;\n",
+                       [EPrefix, Sym, mk_c_var(gpb_aa_, Sym)])
                     || {Sym, _Value} <- Enumerations] ++
                    [?f("    default: relem[i] = gpb_aa_undefined;\n")] ++
                    [?f("}\n")];
