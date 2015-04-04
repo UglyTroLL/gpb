@@ -1,5 +1,84 @@
 -*- coding: utf-8 -*-
 
+Version 3.17.12
+2015-Mar-08
+
+	* Bugfix exported types for CamelCase message names. Thanks to
+	Louis-Philippe Gauthier for fixing and to Luis Rascão for adding a
+	test for it.
+
+Version 3.17.11
+2015-Feb-23
+
+	* When generating typespecs, generate types for messages, and
+	export those types. Thanks to Luis Rascão.
+
+Version 3.17.10
+2015-Feb-17
+
+	* Fix Issues Building on Windows/Cygwin. Thanks to Brett Bethke.
+
+Version 3.17.9
+2015-Jan-30
+
+	* When generating typespecs, generate types for enums, and export
+	those types. Thanks to Luis Rascão.
+
+Version 3.17.8
+2015-Jan-25
+
+	* Add support for the enum "option allow_alias = true;" which
+	allows more than one enum to have the same numerical value. Gpb
+	will decode to the first defined enum symbol. Gpb no longer
+	supports allow_alias = false. This option appeared in Google
+	Protobuf version 2.5.0. Thanks to bb4242 for reporting.
+
+Version 3.17.7
+2015-Jan-07
+
+	* Bugfix type specs for strings when using the strings_as_binaries
+	option. Thanks to Luis Rascão.
+
+Version 3.17.6
+2014-Dec-30
+
+	* Bugfix NIF linking in eunit tests on Mac. Thanks to Luis
+	Rascão.
+
+Version 3.17.5
+2014-Dec-15
+
+	* Bugfix generated NIF code for with the -strbin option: the
+	utf8_to_uint32 function was unused, as was (mostly) the
+	utf8_count_codepoints. Thanks to Louis-Philippe Gauthier for
+	reporting.
+
+Version 3.17.4
+2014-Dec-12
+
+	* Bugfix generated NIF code for enums defined within
+	messages. Thanks to Louis-Philippe Gauthier for reporting and
+	providing an initial solution.
+	* Bugfix generated NIF code for strings with the -strbin (or
+	strings_as_binaries) option. Thanks to Louis-Philippe Gauthier for
+	reporting and providing a solution.
+
+
+Version 3.17.3
+2014-Dec-02
+
+	* Bugfix parsing of files that specify a package, and import other
+	files that also specify a(nother) package. Thanks to Wang Chao for
+	asking the question prompting me to fix this.
+	* Add a -pkgs command line option, for use_packages.
+
+Version 3.17.2
+2014-Nov-13
+
+	* Rework the option parsing. No functional changes.
+	* in helpers/git-hooks/pre-push, allow push of non-tagged
+	non-master branches to github.
+
 Version 3.17.1
 2014-Oct-29
 

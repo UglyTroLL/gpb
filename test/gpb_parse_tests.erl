@@ -181,6 +181,15 @@ parses_import_test() ->
         parse_lines(["package p1.p2;",
                      "import \"a/b/c.proto\";"]).
 
+parses_enum_option_test() ->
+    {ok, Elems} = parse_lines(["enum e1 {",
+                               "  option allow_alias = true;",
+                               "  ee1 = 1;",
+                               "  ee2 = 1;",
+                               "}"]),
+    [{{enum,e1}, [{option, allow_alias, true}, {ee1,1},{ee2,1}]}] =
+        do_process_sort_defs(Elems).
+
 generates_correct_absolute_names_test() ->
     {ok, Elems} = parse_lines(["message m1 {"
                                "  message m2 { required uint32 x = 1; }",
@@ -611,7 +620,7 @@ verify_catches_invalid_rpc_arg_ref_test() ->
 
 do_parse_verify_defs(Lines) ->
     {ok, Elems} = parse_lines(Lines),
-    case gpb_parse:post_process(Elems, []) of
+    case post_process(Elems, []) of
         {ok, _} ->
             ok;
         {error, Reasons} ->
@@ -654,5 +663,10 @@ do_process_sort_defs(Defs) ->
     do_process_sort_defs(Defs, []).
 
 do_process_sort_defs(Defs, Opts) ->
-    {ok, Defs2} = gpb_parse:post_process(Defs, Opts),
+    {ok, Defs2} = post_process(Defs, Opts),
     lists:sort(Defs2).
+
+post_process(Elems, Opts) ->
+    {ok, Elems2} = gpb_parse:post_process_one_file(Elems, Opts),
+    gpb_parse:post_process_all_files(Elems2, Opts).
+

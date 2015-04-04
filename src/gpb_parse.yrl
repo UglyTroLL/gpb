@@ -101,6 +101,7 @@ enum_def -> enum identifier '{' enum_fields '}':
                                         {{enum,identifier_name('$2')},'$4'}.
 
 enum_fields -> enum_field enum_fields:  ['$1' | '$2'].
+enum_fields -> option_def enum_fields:  ['$1' | '$2'].
 enum_fields -> ';' enum_fields:         '$2'.
 enum_fields -> '$empty':                [].
 
@@ -281,7 +282,8 @@ Erlang code.
 -include_lib("eunit/include/eunit.hrl").
 -include("../include/gpb.hrl").
 
--export([post_process/2]).
+-export([post_process_one_file/2]).
+-export([post_process_all_files/2]).
 -export([format_post_process_error/1]).
 -export([fetch_imports/1]).
 
@@ -292,8 +294,16 @@ kw_to_identifier({Kw, Line}) ->
 
 literal_value({_TokenType, _Line, Value}) -> Value.
 
-post_process(Defs, Opts) ->
-    case resolve_names(Defs, Opts) of
+post_process_one_file(Defs, Opts) ->
+    case find_package_def(Defs, Opts) of
+        {ok, Package} ->
+            {ok, flatten_qualify_defnames(Defs, Package)};
+        {error, Reasons} ->
+            {error, Reasons}
+    end.
+
+post_process_all_files(Defs, Opts) ->
+    case resolve_names(Defs) of
         {ok, Defs2} ->
             {ok, possibly_prefix_suffix_msgs(
                    normalize_msg_field_options( %% Sort it?
@@ -306,18 +316,12 @@ post_process(Defs, Opts) ->
     end.
 
 %% -> {ok, Defs} | {error, [Reason]}
-resolve_names(Defs, Opts) ->
-    case find_package_def(Defs, Opts) of
-        {ok, Package} ->
-            FlatDefs = flatten_qualify_defnames(Defs, Package),
-            case resolve_refs(FlatDefs, Package) of
-                {ok, RDefs} ->
-                    case verify_defs(RDefs) of
-                        ok ->
-                            {ok, RDefs};
-                        {error, Reasons} ->
-                            {error, Reasons}
-                    end;
+resolve_names(Defs) ->
+    case resolve_refs(Defs) of
+        {ok, RDefs} ->
+            case verify_defs(RDefs) of
+                ok ->
+                    {ok, RDefs};
                 {error, Reasons} ->
                     {error, Reasons}
             end;
@@ -415,7 +419,8 @@ flatten_fields(FieldsOrDefs, FullName) ->
     {lists:reverse(RFields2), Defs2}.
 
 %% Resolve any refs in
-resolve_refs(Defs, Root) ->
+resolve_refs(Defs) ->
+    Root = ['.'],
     {ResolvedRefs, Reasons} =
         lists:mapfoldl(
           fun({{msg,FullName}, Fields}, Acc) ->
@@ -709,7 +714,7 @@ reformat_names(Defs) ->
     lists:map(fun({{msg,Name}, Fields}) ->
                       {{msg,reformat_name(Name)}, reformat_fields(Fields)};
                  ({{enum,Name}, ENs}) ->
-                      {{enum,reformat_name(Name)}, ENs};
+                      {{enum,reformat_name(Name)}, reformat_enum_opt_names(ENs)};
                  ({{extensions,Name}, Exts}) ->
                       {{extensions,reformat_name(Name)}, Exts};
                  ({{extend,Name}, Fields}) ->
@@ -733,6 +738,16 @@ reformat_fields(Fields) ->
               O#gpb_oneof{fields=reformat_fields(Fs)}
       end,
       Fields).
+
+%% `Defs' is expected to be parsed.
+reformat_enum_opt_names(Def) ->
+    [case Item of
+         {option, Name, Value} ->
+             {option, reformat_name(Name), Value};
+         Other ->
+             Other
+     end
+     || Item <- Def].
 
 reformat_name(Name) ->
     list_to_atom(string:join([atom_to_list(P) || P <- Name,
